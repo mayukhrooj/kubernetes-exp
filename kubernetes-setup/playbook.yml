@@ -1,0 +1,407 @@
+---
+- hosts: all
+  become: true
+  tasks:
+  - name: Install packages that allow apt to be used over HTTPS
+    apt:
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - apt-transport-https
+      - ca-certificates
+      - curl
+      - gnupg-agent
+      - software-properties-common
+      - make
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Add an apt signing key for Docker
+    apt_key:
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Add apt repository for stable version
+    apt_repository:
+      repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu xenial stable
+      state: present
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Install docker and its dependecies
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+      - docker-ce 
+      - docker-ce-cli 
+      - containerd.io
+    notify:
+      - docker status
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Setup sudo group for passwordless sudo
+    lineinfile: 
+      dest: /etc/sudoers
+      state: present
+      regexp: '^%sudo' 
+      line: '%sudo ALL=(ALL) NOPASSWD: ALL'
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Add vagrant user to docker group
+    user:
+      name: vagrant
+      group: "{{item}}"
+    with_items:
+      - docker
+      - sudo
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  # Disable swap to make sure that the kubelet starts
+  - name: Remove swapfile from /etc/fstab
+    mount:
+      name: "{{ item }}"
+      fstype: swap
+      state: absent
+    with_items:
+      - swap
+      - none
+    tags:
+      - master
+      - install_kube
+
+  - name: Disable swap
+    command: swapoff -a
+    when: ansible_swaptotal_mb > 0
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  #Install kubelet and kubeadm
+  - name: Add an apt signing key for Kubernetes
+    apt_key:
+      url: https://packages.cloud.google.com/apt/doc/apt-key.gpg
+      state: present
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Adding apt repository for Kubernetes
+    apt_repository:
+      repo: deb https://apt.kubernetes.io/ kubernetes-xenial main
+      state: present
+      filename: kubernetes.list
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Install Kubernetes binaries
+    apt: 
+      name: "{{ packages }}"
+      state: present
+      update_cache: yes
+    vars:
+      packages:
+        - kubelet=1.19.10-00 #1.19 because from 1.20 kubernetes has deprecated docker cri
+        - kubeadm=1.19.10-00
+        - kubectl=1.19.10-00
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Configure node ip
+    lineinfile:
+      path: /lib/systemd/system/kubelet.service
+      regexp: '^ExecStart=/usr/bin/kubelet'
+      line: "ExecStart=/usr/bin/kubelet --node-ip={{ node_ip }}"
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Restart kubelet
+    service:
+      name: kubelet
+      daemon_reload: yes
+      state: restarted
+    tags:
+      - master
+      - worker
+      - install_kube
+
+    #Initialize cluster if running first time
+  - name: Check if kubeadm cluster is already initialized
+    stat:
+      path: /etc/kubernetes/manifests/kube-controller-manager.yaml
+    register: kube_controller_configuration_file
+    tags:
+      - master
+      - worker
+      - install_kube
+
+  - name: Client should wait until the master has finished configuring the services
+    wait_for:
+      path: /vagrant/tmp/master_bootstrapped
+    tags:
+      - worker
+      - install_kube
+
+  - name: Initialize the Kubernetes cluster using kubeadm
+    command: kubeadm init --apiserver-advertise-address="192.168.50.10" --apiserver-cert-extra-sans="192.168.50.10"  --node-name k8s-master-1 --pod-network-cidr=192.168.50.0/24
+    when: not kube_controller_configuration_file.stat.exists
+    tags:
+      - master
+      # - worker
+      - install_kube
+
+  # Setup kubeconfig
+  - name: Setup kubeconfig for vagrant user
+    command: "{{ item }}"
+    with_items:
+     - mkdir -p /home/vagrant/.kube
+     - cp -i /etc/kubernetes/admin.conf /home/vagrant/.kube/config
+     - chown vagrant:vagrant /home/vagrant/.kube/config
+     - cp -i /home/vagrant/.kube/config /vagrant/tmp/kubeconfig
+    tags:
+      - master
+      - install_kube
+
+  - name: Wait until all the kube processes are up and running
+    wait_for:
+      port: "{{item | int}}"
+      delay: 10
+    with_items:
+      - 10249 # kube-proxy
+      - 2379 # etcd
+      - 10257 # kube-controller
+      - 10259 # kube-scheduler
+      - 6443 # kube-api-server
+    tags:
+      - master
+      - install_kube
+
+  - name: Check if calico port port is open
+    wait_for:
+      port: 9099
+      state: started
+      timeout: 10
+    register: calico_started
+    ignore_errors: yes
+    tags:
+      - calico
+      - master
+
+  - name: Install calico pod network
+    become: false
+    command: kubectl create -f https://docs.projectcalico.org/manifests/calico.yaml
+    when: ("state" not in calico_started.keys()) or (calico_started.state != "started")
+    tags:
+      - calico
+      - master
+
+  # Generate kube join command
+  - name: Generate join command
+    command: kubeadm token create --print-join-command
+    register: join_command
+    tags:
+      - join
+      - master
+
+  - name: Debug print join join_command
+    debug:
+      msg: join_command
+    tags:
+      - join
+      - master
+
+  - name: Create a tmp folder for tracking provisioning of the cluster
+    file:
+      state: directory
+      dest: /vagrant/tmp
+    tags:
+      - master
+
+  - name: Copy join command to local file
+    copy: 
+      content: "{{ join_command.stdout_lines[0] }}"
+      dest: "/vagrant/tmp/join-command"
+    tags:
+      - join
+      - master
+
+  - name: Signal that the workers that master has bootstrapped
+    file:
+      state: touch
+      dest: /vagrant/tmp/master_bootstrapped
+    tags:
+      - master
+
+  - #Join the cluster
+  - name: Copy the join command to server location
+    copy:
+      remote_src: yes
+      src: /vagrant/tmp/join-command
+      dest: /tmp/join-command.sh
+      mode: 0750
+    tags:
+      - worker
+      - join
+
+  - name: Reset kubeadm
+    command: kubeadm reset -f
+    tags:
+      - worker
+      - join
+
+  # In case of reruns this resets the preflight checks and unmounts kubelet
+  - name: Join the node to cluster
+    command: sh /tmp/join-command.sh
+    tags:
+      - worker
+      - join
+
+  - name: Setup kubeconfig for vagrant user
+    command: "{{ item }}"
+    with_items:
+     - mkdir -p /home/vagrant/.kube
+     - cp -i /vagrant/tmp/kubeconfig /home/vagrant/.kube/config 
+     - chown vagrant:vagrant /home/vagrant/.kube/config
+    tags:
+      - worker
+      - join
+
+  # we need need to find a way to wait for both master and node working fine
+   # Defining the kubernetes deployment as a ansible fact dictionary
+  # we will then save this fact dictionary to a file and then run it
+  # using kubectl apply -f 
+  - name: Set kubernetes deployment as an ansible fact
+    tags:
+    - master
+    - app
+    set_fact:
+      kubernetes_deployment:
+        apiVersion: apps/v1
+        kind: Deployment
+        metadata:
+          name: hello-world
+        spec:
+          replicas: 1 #this should be equal to no of worker
+          selector:
+            matchLabels:
+              app: hello-world 
+          template:
+            metadata:
+              labels:
+                app: hello-world
+            spec:
+              containers:
+              - name: hello-world
+                image: mayukhrooj/hello_world_nodejs:latest
+                ports: 
+                - containerPort: 80
+                - containerPort: 443
+      kubernetes_service:
+        apiVersion: v1
+        kind: Service
+        metadata:
+          name: hello-world-service
+        spec:
+          selector:
+            app: hello-world
+          ports:
+          - name: http
+            protocol: TCP
+            port: 80
+            targetPort: 8080
+          type: LoadBalancer
+          externalIPs:
+          - 192.168.50.16
+      kubernetes_ingress:
+        apiVersion: networking.k8s.io/v1
+        kind: Ingress
+        metadata:
+          name: helloworld-ingress
+          annotations:
+            nginx.ingress.kubernetes.io/rewrite-target: /
+        spec:
+          rules:
+          - http:
+              paths:
+              - path: /
+                pathType: Prefix
+                backend:
+                  service:
+                    name: hello-world-service
+                    port:
+                      number: 80
+    
+  # Save the kubernetes objects to file
+  - name: "create a deplyment directory"
+    file:
+      dest: /tmp/hello-world
+      state: directory
+    tags:
+    - app
+    - master
+  - name: "save kubernetes deployment manifest to /tmp"
+    copy:
+      content: "{{kubernetes_deployment}}"
+      dest: /tmp/hello-world/deployment.json
+    tags:
+    - app
+    - master
+
+  - name: "save kubernetes service manifest to /tmp"
+    copy:
+      content: "{{kubernetes_service}}"
+      dest: /tmp/hello-world/service.json
+    tags:
+    - master
+    - app
+  - name: "save kubernetes ingress manifest to /tmp"
+    copy:
+      content: "{{kubernetes_ingress}}"
+      dest: /tmp/hello-world/ingress.json
+    tags:
+    - master
+    - app
+  # Apply the manifest using kubectl in the default namespace
+  - name: "apply deployment manifest"
+    shell: kubectl -n default apply -f /tmp/hello-world
+    become: false
+    tags:
+    - master
+    - app 
+
+
+  handlers:
+    - name: docker status
+      service: name=docker state=started
+      tags:
+       - master
+       - worker
